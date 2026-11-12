@@ -1,17 +1,23 @@
+import asyncio
 import json
 from graph.state import PipelineState
 from config.llm import get_llm
 from schemas.router_schemas import RouterResponse
 from prompts.router_prompts import ROUTER_SYSTEM_PROMPT
 from helpers.router_agent import decide_lane
+from services.event_publisher import event_publisher
 
-def router_agent(state: PipelineState) -> PipelineState:
+async def router_agent(state: PipelineState) -> PipelineState:
     """Decoupled Router Agent:
     - Runs deterministic compliance lane selection (auto_approve, flag_review, amendment_request).
-    - Invokes LLM to generate concise reasoning and draft amendment text.
+    - Formulates concise reasoning and draft amendment text with fast deterministic fallback.
     - Decoupled from human approval: leaves execution suspension to the dedicated human approval node.
+    - Broadcasts decision events to Redis Pub/Sub for real-time UI tracking.
     """
     logs = list(state.get("logs", []))
+    shipment_id = state.get("shipment_id", "unknown")
+    run_id = state.get("run_id")
+
     logs.append("Router Agent: Evaluating compliance validation results...")
 
     validation_results = state.get("validation_results", {})
@@ -25,6 +31,16 @@ def router_agent(state: PipelineState) -> PipelineState:
     if decision == "auto_approve":
         reasoning = "All trade documents comply with customer rules and cross-document consistency checks."
         logs.append("Router Agent: Auto-approval granted. No amendment draft needed.")
+
+        await event_publisher.publish(
+            shipment_id=shipment_id,
+            step="route_complete",
+            status="approved",
+            message="Router granted auto-approval. Proceeding to completion.",
+            run_id=run_id,
+            data={"decision": decision, "reasoning": reasoning}
+        )
+
         return {
             **state,
             "decision": decision,
@@ -35,63 +51,66 @@ def router_agent(state: PipelineState) -> PipelineState:
             "logs": logs
         }
 
-    # 3. For flag_review or amendment_request, invoke LLM to formulate clear reasoning and draft
-    logs.append("Router Agent: Invoking LLM to formulate concise discrepancy reasoning and amendment draft...")
-    llm = get_llm()
-    reasoning = ""
-    amendment_draft = ""
+    # 3. Formulate instant deterministic reasoning & draft fallback
+    discrepancies = cross_doc_results.get("discrepancies", [])
+    discrepancy_desc = "; ".join([
+        f"{d.get('field', 'field')} mismatch: {', '.join(map(str, d.get('values', [])))}"
+        for d in discrepancies
+    ])
 
-    prompt = f"""
-    The pre-selected workflow decision is: {decision}
+    rule_issues = []
+    for doc, fields_res in validation_results.items():
+        if isinstance(fields_res, dict):
+            for f, r in fields_res.items():
+                if isinstance(r, dict) and r.get("result") == "mismatch":
+                    rule_issues.append(f"{f} ({r.get('reason', 'rule violation')})")
 
-    Here is the field-by-field Validation Results:
-    {json.dumps(validation_results, indent=2)}
+    rule_desc = "; ".join(rule_issues)
 
-    Here is the Cross-Document Consistency Results:
-    {json.dumps(cross_doc_results, indent=2)}
+    if decision == "amendment_request":
+        reasoning = f"Cross-document discrepancy detected: {discrepancy_desc or 'Document values do not match across files.'}"
+        amendment_draft = f"Dear Shipper,\n\nPlease issue an amended document packet correcting the following discrepancy: {discrepancy_desc or 'conflicting field values'}.\n\nThank you,\nTrade Compliance Team"
+    else:
+        reasoning = f"Policy violation detected: {rule_desc or 'Field values conflict with customer compliance rules.'}"
+        amendment_draft = f"Dear Shipper,\n\nThe following items do not comply with shipping policy: {rule_desc or 'unauthorized values'}.\n\nThank you,\nTrade Compliance Team"
 
-    Write concise reasoning (2-3 sentences) and a concise draft message if required.
-    Keep explanations direct and avoid unnecessary filler. If there are cross-document discrepancies, list them clearly.
-    """
-
+    # Optional fast LLM enhancement (bounded by 2-second timeout to prevent API hangs)
     try:
-        structured_llm = llm.with_structured_output(RouterResponse)
-        router_result = structured_llm.invoke([
-            {"role": "system", "content": ROUTER_SYSTEM_PROMPT},
-            {"role": "user", "content": prompt}
-        ])
-        reasoning = router_result.reasoning
-        amendment_draft = router_result.amendment_draft
-    except Exception as e:
-        logs.append(f"Router Agent: Structured output failed ({str(e)}). Running fallback JSON prompt...")
-        fallback_prompt = f"""{ROUTER_SYSTEM_PROMPT}
-        You must output a raw JSON object matching this schema exactly:
-        {{
-            "reasoning": "string",
-            "amendment_draft": "string"
-        }}
-        Do not include markdown wrappers (like ```json), just output raw JSON.
-
-        Decision: {decision}
-        Validation Results:
-        {json.dumps(validation_results, indent=2)}
-        Cross-Document Consistency Results:
-        {json.dumps(cross_doc_results, indent=2)}
+        llm = get_llm()
+        prompt = f"""
+        Pre-selected decision: {decision}
+        Validation Results: {json.dumps(validation_results, indent=2)}
+        Cross-Doc Results: {json.dumps(cross_doc_results, indent=2)}
+        Write concise reasoning and amendment draft. Output JSON: {{"reasoning": "...", "amendment_draft": "..."}}
         """
-        try:
-            response = llm.invoke([{"role": "user", "content": fallback_prompt}])
-            content = response.content.strip()
+        async def _call_llm():
+            res = await asyncio.to_thread(llm.invoke, [{"role": "user", "content": prompt}])
+            content = res.content.strip()
             if content.startswith("```"):
                 content = content.replace("```json", "", 1).replace("```", "").strip()
-            res_dict = json.loads(content)
-            reasoning = res_dict.get("reasoning", "Compliance discrepancy detected during validation.")
-            amendment_draft = res_dict.get("amendment_draft", "")
-        except Exception as e_fallback:
-            logs.append(f"Router Agent: Fallback failed ({str(e_fallback)}). Setting default notes.")
-            reasoning = f"Deterministic decision: {decision}. Compliance discrepancies require inspection."
-            amendment_draft = "Please review the document discrepancies manually."
+            return json.loads(content)
+
+        parsed_llm = await asyncio.wait_for(_call_llm(), timeout=2.5)
+        reasoning = parsed_llm.get("reasoning", reasoning)
+        amendment_draft = parsed_llm.get("amendment_draft", amendment_draft)
+        logs.append("Router Agent: LLM formulated enhanced reasoning.")
+    except Exception as e_llm:
+        logs.append(f"Router Agent: Using deterministic draft ({type(e_llm).__name__}).")
 
     logs.append(f"Router Agent: Finished lane '{decision}'. Routing to separate Human Approval Node.")
+
+    await event_publisher.publish(
+        shipment_id=shipment_id,
+        step="route_complete",
+        status="pending_approval",
+        message=f"Router selected lane '{decision}'. Routing to Human Approval node.",
+        run_id=run_id,
+        data={
+            "decision": decision,
+            "decision_reason": reasoning,
+            "amendment_draft": amendment_draft
+        }
+    )
 
     return {
         **state,

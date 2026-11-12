@@ -8,6 +8,7 @@ from schemas.extractor_schemas import TradeDocumentExtraction
 from helpers.extractor_helper import extract_single_file, compute_confidence_scores
 from helpers.common_helpers import get_gemini_client
 from services.llm_limiter import llm_limiter, LlmSlotContext
+from services.event_publisher import event_publisher
 
 async def extract_agent(state: PipelineState) -> PipelineState:
     """Multi-document extraction agent powered by Gemini Vision.
@@ -19,7 +20,7 @@ async def extract_agent(state: PipelineState) -> PipelineState:
     file_bytes_map = state.get("file_bytes_map", {})
     file_paths = state.get("file_paths", [])
     retry_count = state.get("extraction_retry_count", 0)
-    max_retries = state.get("max_extraction_retries", getattr(settings, "max_extraction_retries", 3))
+    max_retries = state.get("max_extraction_retries", settings.max_extraction_retries)
     prev_low_fields = state.get("low_confidence_fields", [])
 
     logs.append(
@@ -27,11 +28,13 @@ async def extract_agent(state: PipelineState) -> PipelineState:
         f"for {len(filenames)} documents..."
     )
 
+    # 1. Resolve file bytes (from in-memory bytes map or local paths)
     resolved_bytes: Dict[str, bytes] = {}
     for name in filenames:
         if name in file_bytes_map:
             resolved_bytes[name] = file_bytes_map[name]
         else:
+            # Check local file paths
             matched_path = next((p for p in file_paths if os.path.basename(p) == name or p.endswith(name)), None)
             if matched_path and os.path.exists(matched_path):
                 with open(matched_path, "rb") as f:
@@ -45,9 +48,10 @@ async def extract_agent(state: PipelineState) -> PipelineState:
         config = GenerationConfig(
             response_mime_type="application/json",
             response_schema=TradeDocumentExtraction,
-            temperature=0.1 if retry_count == 0 else 0.2
+            temperature=0.1 if retry_count == 0 else 0.2  # Slightly higher temperature on retry for exploration
         )
 
+        # 2. Extract each document under the Tier 2 distributed LLM concurrency limiter
         async def _extract_file_task(name: str, b_data: bytes):
             async with LlmSlotContext(llm_limiter):
                 return await asyncio.to_thread(
@@ -79,17 +83,29 @@ async def extract_agent(state: PipelineState) -> PipelineState:
     except Exception as e:
         logs.append(f"Extractor Agent: Client initialization error ({str(e)})")
 
+    # 3. Compute extraction confidence metrics
     avg_conf, low_fields = compute_confidence_scores(extracted_data)
-    threshold = getattr(settings, "extraction_confidence_threshold", 0.70)
+    threshold = settings.extraction_confidence_threshold
 
     is_low_confidence = (avg_conf < threshold) or (len(low_fields) > 0 and avg_conf < 0.80)
     can_retry = is_low_confidence and (retry_count < max_retries)
     needs_human = is_low_confidence and (retry_count >= max_retries)
 
+    shipment_id = state.get("shipment_id", "unknown")
+    run_id = state.get("run_id")
+
     if can_retry:
         logs.append(
             f"Extractor Agent: Low confidence detected (avg: {avg_conf:.2f} < {threshold}). "
             f"Low fields: {low_fields}. Scheduling retry {retry_count + 1} of {max_retries}."
+        )
+        await event_publisher.publish(
+            shipment_id=shipment_id,
+            step="extract_retry",
+            status="extracting",
+            message=f"Low extraction confidence ({avg_conf:.2f} < {threshold}) on {low_fields}. Scheduling OCR retry {retry_count + 1}/{max_retries}...",
+            run_id=run_id,
+            data={"avg_confidence": avg_conf, "low_confidence_fields": low_fields, "retry_count": retry_count + 1}
         )
         return {
             **state,
@@ -106,6 +122,14 @@ async def extract_agent(state: PipelineState) -> PipelineState:
             f"Extractor Agent: Maximum retries ({max_retries}) exhausted. "
             f"Average confidence is {avg_conf:.2f}. Triggering Human Correction node."
         )
+        await event_publisher.publish(
+            shipment_id=shipment_id,
+            step="extract_exhausted",
+            status="pending_correction",
+            message=f"OCR retries ({max_retries}) exhausted with confidence {avg_conf:.2f}. Routing to Human Correction node.",
+            run_id=run_id,
+            data={"avg_confidence": avg_conf, "low_confidence_fields": low_fields}
+        )
         return {
             **state,
             "extracted_data": extracted_data,
@@ -121,6 +145,14 @@ async def extract_agent(state: PipelineState) -> PipelineState:
             f"Extractor Agent: Extraction successful with high confidence ({avg_conf:.2f} >= {threshold}). "
             "Proceeding to validation."
         )
+        await event_publisher.publish(
+            shipment_id=shipment_id,
+            step="extract_complete",
+            status="validating",
+            message=f"Document extraction completed with high confidence ({avg_conf:.2f}). Proceeding to validation.",
+            run_id=run_id,
+            data={"avg_confidence": avg_conf}
+        )
         return {
             **state,
             "extracted_data": extracted_data,
@@ -131,4 +163,3 @@ async def extract_agent(state: PipelineState) -> PipelineState:
             "status": "validating",
             "logs": logs
         }
-

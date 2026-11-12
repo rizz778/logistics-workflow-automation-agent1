@@ -13,6 +13,7 @@ from db.checkpointer import checkpointer_manager
 from graph.graph import create_pipeline
 from services.s3_service import s3_service
 from services.db_service import db_service
+from services.event_publisher import EventPublisher, event_publisher
 
 logger = logging.getLogger("agent_worker.daemon")
 
@@ -31,6 +32,7 @@ class TradeDocWorkerDaemon:
         self.dlq_stream_name = f"{self.stream_name}_dlq"
         self._running = False
         self._redis: Optional[aioredis.Redis] = None
+        self.publisher = event_publisher
 
     async def _init_consumer_group(self, redis: aioredis.Redis) -> None:
         """Initializes the Redis Streams consumer group if it does not already exist."""
@@ -70,6 +72,7 @@ class TradeDocWorkerDaemon:
                 decode_responses=True,
                 socket_connect_timeout=3.0
             )
+            self.publisher = EventPublisher(redis_client=self._redis)
             await self._init_consumer_group(self._redis)
         except Exception as e:
             logger.error("Failed to connect to Redis at %s: %s", self.redis_url, e)
@@ -157,9 +160,24 @@ class TradeDocWorkerDaemon:
             # Case A: Initial Document Ingestion & Compliance Run
             if event_type in ("INITIAL_PROCESS", "RETRY"):
                 logger.info("Streaming document files from S3 for shipment '%s'...", shipment_id)
+                await self.publisher.publish(
+                    shipment_id=shipment_id,
+                    step="download",
+                    status="processing",
+                    message=f"Streaming {len(files)} trade document(s) from object storage...",
+                    run_id=run_id
+                )
                 file_bytes_map = s3_service.download_shipment_files(files)
 
                 await db_service.update_run_status(shipment_id, "processing")
+                await self.publisher.publish(
+                    shipment_id=shipment_id,
+                    step="extract",
+                    status="extracting",
+                    message="Starting multi-document extraction via Gemini Vision...",
+                    run_id=run_id,
+                    data={"filenames": [f.get("filename") for f in files if f.get("filename")]}
+                )
 
                 initial_state = {
                     "shipment_id": shipment_id,
@@ -192,17 +210,57 @@ class TradeDocWorkerDaemon:
                         cross_doc_results=final_state.get("cross_doc_results")
                     )
 
+                    await self.publisher.publish(
+                        shipment_id=shipment_id,
+                        step="completed",
+                        status=final_state.get("status", "approved"),
+                        message=f"Compliance check completed. Decision: '{final_state.get('decision')}'.",
+                        run_id=run_id,
+                        data={
+                            "decision": final_state.get("decision"),
+                            "decision_reason": final_state.get("decision_reason"),
+                            "amendment_draft": final_state.get("amendment_draft"),
+                            "avg_confidence": final_state.get("avg_confidence")
+                        }
+                    )
+
                 except GraphInterrupt as gi:
                     logger.info("Pipeline interrupted for HitL intervention on shipment '%s'. Details: %s",
                                 shipment_id, gi.args[0] if gi.args else "")
 
                     state_snapshot = await graph.aget_state(config)
                     next_nodes = state_snapshot.next if state_snapshot else ()
+                    values = state_snapshot.values if state_snapshot else {}
 
                     if "human_correction" in next_nodes:
                         await db_service.update_run_status(shipment_id, "pending_correction")
+                        await self.publisher.publish(
+                            shipment_id=shipment_id,
+                            step="human_correction",
+                            status="pending_correction",
+                            message="Extraction confidence below threshold (0.70). Paused for human operator correction.",
+                            run_id=run_id,
+                            data={
+                                "low_confidence_fields": values.get("low_confidence_fields", []),
+                                "avg_confidence": values.get("avg_confidence", 0.0),
+                                "extracted_data": values.get("extracted_data", {})
+                            }
+                        )
                     else:
                         await db_service.update_run_status(shipment_id, "pending_review")
+                        await self.publisher.publish(
+                            shipment_id=shipment_id,
+                            step="human_approval",
+                            status="pending_review",
+                            message=f"Discrepancies flagged. Paused for auditor review. Decision: '{values.get('decision')}'.",
+                            run_id=run_id,
+                            data={
+                                "decision": values.get("decision"),
+                                "decision_reason": values.get("decision_reason"),
+                                "amendment_draft": values.get("amendment_draft"),
+                                "cross_doc_results": values.get("cross_doc_results")
+                            }
+                        )
 
             # Case B: Human Operator Resumes from Checkpoint
             elif event_type == "HUMAN_EDIT_REPROCESS":
@@ -210,6 +268,15 @@ class TradeDocWorkerDaemon:
 
                 run_record = await db_service.get_run(shipment_id)
                 human_edits = (run_record.get("edited_data") if run_record else None) or event.get("edited_data") or {}
+
+                await self.publisher.publish(
+                    shipment_id=shipment_id,
+                    step="human_resumed",
+                    status="processing",
+                    message="Human operator inputs received. Resuming compliance workflow from checkpoint...",
+                    run_id=run_id,
+                    data={"edited_fields": list(human_edits.keys())}
+                )
 
                 try:
                     final_state = await graph.ainvoke(Command(resume=human_edits), config=config)
@@ -228,10 +295,29 @@ class TradeDocWorkerDaemon:
                         cross_doc_results=final_state.get("cross_doc_results")
                     )
 
+                    await self.publisher.publish(
+                        shipment_id=shipment_id,
+                        step="completed",
+                        status=final_state.get("status", "approved"),
+                        message=f"Resumed workflow completed. Decision: '{final_state.get('decision')}'.",
+                        run_id=run_id,
+                        data={
+                            "decision": final_state.get("decision"),
+                            "decision_reason": final_state.get("decision_reason")
+                        }
+                    )
+
                 except GraphInterrupt as gi:
                     logger.info("Resumed workflow paused again on HitL node for '%s': %s",
                                 shipment_id, gi.args[0] if gi.args else "")
                     await db_service.update_run_status(shipment_id, "pending_review")
+                    await self.publisher.publish(
+                        shipment_id=shipment_id,
+                        step="human_approval",
+                        status="pending_review",
+                        message="Workflow paused again on HitL approval.",
+                        run_id=run_id
+                    )
 
         if self._redis:
             await self._redis.xack(self.stream_name, self.group_name, message_id)
@@ -259,6 +345,14 @@ class TradeDocWorkerDaemon:
                 shipment_id, retry_count, max_retries, backoff_delay, error
             )
 
+            await self.publisher.publish(
+                shipment_id=shipment_id,
+                step="task_retry",
+                status="retrying",
+                message=f"Pipeline task error: {error}. Backing off for {backoff_delay}s (Attempt {retry_count}/{max_retries}).",
+                data={"retry_count": retry_count, "max_retries": max_retries, "error": str(error)}
+            )
+
             event["retry_count"] = retry_count
             event["event_type"] = "RETRY"
             event["last_error"] = str(error)
@@ -271,6 +365,14 @@ class TradeDocWorkerDaemon:
             logger.error(
                 "🚨 Task '%s' failed %d retries. Pushing to Dead Letter Queue '%s'...",
                 shipment_id, max_retries, self.dlq_stream_name
+            )
+
+            await self.publisher.publish(
+                shipment_id=shipment_id,
+                step="dlq_exhausted",
+                status="failed",
+                message=f"Pipeline task failed after {max_retries} attempts. Moved to Dead Letter Queue.",
+                data={"final_error": str(error)}
             )
 
             event["final_error"] = str(error)
