@@ -1,8 +1,13 @@
 """Entry point for the Trade Document Agent Worker service.
 Listens to Redis Streams and executes the multi-agent LangGraph compliance pipeline.
 """
+import sys
 import asyncio
 import logging
+
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
 from services.worker_daemon import TradeDocWorkerDaemon
 
 logging.basicConfig(

@@ -1,5 +1,9 @@
+from pathlib import Path
 from typing import Optional
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Always resolve .env from the project root, regardless of CWD
+_ENV_FILE = Path(__file__).parent.parent / ".env"
 
 class Settings(BaseSettings):
     # Application
@@ -32,9 +36,10 @@ class Settings(BaseSettings):
 
     # LLM Settings
     default_llm_provider: str = "gemini"
-    gemini_model: str = "gemini-3.5-flash"
+    gemini_model: str = "gemini-2.0-flash"
     gemini_api_key: Optional[str] = None
-    mistral_model: str = "ministral-3b-latest"
+    mistral_ocr_model: str = "mistral-ocr-latest"
+    mistral_extract_model: str = "pixtral-large-latest"
     mistral_api_key: Optional[str] = None
     openai_model: str = "gpt-4o-mini"
     openai_api_key: Optional[str] = None
@@ -42,7 +47,7 @@ class Settings(BaseSettings):
     anthropic_api_key: Optional[str] = None
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=str(_ENV_FILE),
         env_file_encoding="utf-8",
         extra="ignore"
     )

@@ -78,6 +78,9 @@ class TradeDocWorkerDaemon:
             logger.error("Failed to connect to Redis at %s: %s", self.redis_url, e)
             logger.info("Worker daemon will idle in polling mode until Redis is online.")
 
+        # Initialize checkpointer and run DB migrations ONCE at startup (eliminates ~2min per-task lag)
+        await checkpointer_manager.initialize()
+
         while self._running:
             try:
                 if self._redis is None:
@@ -116,6 +119,7 @@ class TradeDocWorkerDaemon:
                 logger.error("Unexpected error in worker consumer loop: %s", e)
                 await asyncio.sleep(1.0)
 
+        await checkpointer_manager.close()
         logger.info("Worker daemon stopped gracefully.")
 
     def stop(self) -> None:

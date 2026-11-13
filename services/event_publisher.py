@@ -12,7 +12,7 @@ from config.settings import settings
 logger = logging.getLogger("agent_worker.event_publisher")
 
 
-def is_socket_reachable(host: str, port: int, timeout: float = 0.2) -> bool:
+def is_socket_reachable(host: str, port: int, timeout: float = 2.5) -> bool:
     """Fast non-blocking probe to avoid connection hangs if Redis is offline."""
     target_host = "127.0.0.1" if host in ("localhost", "127.0.0.1") else host
     try:
@@ -38,9 +38,6 @@ class EventPublisher:
     async def _get_redis(self) -> Optional[aioredis.Redis]:
         if self._redis is not None:
             return self._redis
-
-        if not is_socket_reachable(self.host, self.port):
-            return None
 
         try:
             self._redis = aioredis.from_url(

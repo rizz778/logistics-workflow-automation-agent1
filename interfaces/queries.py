@@ -8,15 +8,13 @@ SET extracted_data = %s::jsonb,
     decision = %s,
     decision_reason = %s,
     amendment_draft = %s,
-    status = %s,
-    updated_at = NOW()
+    status = %s
 WHERE shipment_id = %s;
 """
 
 UPDATE_RUN_STATUS_SQL = """
 UPDATE pipeline_runs
-SET status = %s,
-    updated_at = NOW()
+SET status = %s
 WHERE shipment_id = %s;
 """
 

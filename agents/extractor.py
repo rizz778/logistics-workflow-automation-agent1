@@ -1,14 +1,15 @@
 import asyncio
+import logging
 import os
 from typing import Dict, Any, List
-from google.generativeai.types import GenerationConfig
 from graph.state import PipelineState
 from config.settings import settings
-from schemas.extractor_schemas import TradeDocumentExtraction
 from helpers.extractor_helper import extract_single_file, compute_confidence_scores
 from helpers.common_helpers import get_gemini_client
 from services.llm_limiter import llm_limiter, LlmSlotContext
 from services.event_publisher import event_publisher
+
+logger = logging.getLogger("agent_worker.extractor")
 
 async def extract_agent(state: PipelineState) -> PipelineState:
     """Multi-document extraction agent powered by Gemini Vision.
@@ -43,13 +44,7 @@ async def extract_agent(state: PipelineState) -> PipelineState:
     extracted_data = dict(state.get("extracted_data", {}))
 
     try:
-        ai = get_gemini_client()
-        model = ai.GenerativeModel(settings.gemini_model)
-        config = GenerationConfig(
-            response_mime_type="application/json",
-            response_schema=TradeDocumentExtraction,
-            temperature=0.1 if retry_count == 0 else 0.2  # Slightly higher temperature on retry for exploration
-        )
+        client = get_gemini_client()
 
         # 2. Extract each document under the Tier 2 distributed LLM concurrency limiter
         async def _extract_file_task(name: str, b_data: bytes):
@@ -58,8 +53,8 @@ async def extract_agent(state: PipelineState) -> PipelineState:
                     extract_single_file,
                     b_data,
                     name,
-                    model,
-                    config,
+                    client,
+                    settings.gemini_model,
                     retry_count,
                     prev_low_fields
                 )
@@ -74,13 +69,17 @@ async def extract_agent(state: PipelineState) -> PipelineState:
             results = await asyncio.gather(*tasks, return_exceptions=True)
             for res in results:
                 if isinstance(res, Exception):
+                    logger.error("Extractor task raised an unhandled exception: %s", res, exc_info=res)
                     logs.append(f"Extractor Agent: Task error ({res})")
                 else:
                     doc_name, doc_data, log_msg = res
                     extracted_data[doc_name] = doc_data
+                    if "FAILED" in log_msg:
+                        logger.warning("Extractor Agent: %s", log_msg)
                     logs.append(log_msg)
 
     except Exception as e:
+        logger.error("Extractor Agent: Gemini client initialization error: %s", e, exc_info=True)
         logs.append(f"Extractor Agent: Client initialization error ({str(e)})")
 
     # 3. Compute extraction confidence metrics

@@ -1,17 +1,18 @@
 import sqlite3
 from typing import Optional
-import google.generativeai as genai
+from google import genai
 from config.settings import settings
 import os
 import json
 
-def get_gemini_client():
-    """Configures and returns the google.generativeai package."""
+def get_gemini_client() -> genai.Client:
+    """Creates and returns a google.genai Client instance."""
     api_key = settings.gemini_api_key or os.getenv("GEMINI_API_KEY")
     if not api_key:
         raise ValueError("GEMINI_API_KEY is not set.")
-    genai.configure(api_key=api_key)
-    return genai
+    return genai.Client(api_key=api_key)
+
+    return Mistral(api_key=api_key)
 
 def load_rules() -> dict:
     """Loads rules from config or falls back to defaults."""
