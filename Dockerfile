@@ -1,18 +1,18 @@
-# Use official lightweight Python image
-FROM python:3.10-slim
+# Lightweight Python base image
+FROM python:3.11-slim
 
-# Set environment variables
+# Prevent Python from writing .pyc files and enable unbuffered output
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
-# Set work directory
 WORKDIR /app
 
-# Install system dependencies (including potential PDF parsing or image libraries)
+# Install system dependencies for OCR, PDF processing, and native builds
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
-    libgl1-mesa-glx \
+    libgl1 \
     libglib2.0-0 \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies
@@ -20,14 +20,11 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
-# Copy backend code
+# Copy application source code
 COPY . .
 
-# Create persistent directories for SQLite DB, Inbox files, and Processed logs
-RUN mkdir -p data inbox processed
-
-# Expose backend port
+# Expose port 8000 for cloud health checks (e.g. Koyeb Free Tier)
 EXPOSE 8000
 
-# Start command running Uvicorn server (host 0.0.0.0 is critical for Docker)
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+# Run the Trade Document Agent Worker daemon
+CMD ["python", "worker.py"]
